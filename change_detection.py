@@ -9,8 +9,8 @@ import os
 import sys
 import numpy as np
 import pandas as pd
-from sklearn.cluster import DBSCAN
-from scipy.spatial import Delaunay, cKDTree
+from scipy.spatial import cKDTree
+
 # import matplotlib.pyplot as plt
 
 from VoxelChangeDetector import VoxelChangeDetector
@@ -47,7 +47,7 @@ for part in parts:
     tree_level_rows_for_part = []
 
     current_dir = os.getcwd()
-    root_path = rf"{current_dir}\data\{part}"
+    root_path = rf"{current_dir}/data/{part}"
     trees_2022 = os.path.join(root_path, "2022")
     trees_2023 = os.path.join(root_path, "2023")
     
@@ -57,7 +57,7 @@ for part in parts:
                                key=lambda x: int(x.split(' ')[2]))
     
     # QSM files
-    adtreeqsm_folder = os.path.join(root_path, r"2022\adtree_qsm3")
+    adtreeqsm_folder = os.path.join(root_path, r"2022/adtree_qsm3")
 
     original_sorted_qsms = sorted(
         [f for f in os.listdir(adtreeqsm_folder) if 'qsm_origins' in f and f.endswith('.csv')],

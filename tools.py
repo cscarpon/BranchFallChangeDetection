@@ -1,11 +1,11 @@
 import numpy as np
 import laspy
-from plyfile import PlyData, PlyElement
-import open3d as o3d
+# from plyfile import PlyData, PlyElement
+# import open3d as o3d
 import pandas as pd
-import matplotlib.colors as mcolors
+# import matplotlib.colors as mcolors
 from sklearn.cluster import DBSCAN
-import sys
+# import sys
 
 def extract_intact_branch_from_axis(axis_id, qsm_df, paths_df):
     axis_cylinders = qsm_df[qsm_df['axis_ID'] == axis_id]
