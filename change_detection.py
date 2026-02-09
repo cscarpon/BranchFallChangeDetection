@@ -23,7 +23,8 @@ from tools import dbscan_connectivity, points_in_voxels, extract_branch_from_axi
 # parts = ["part2a", "part2b"]
 # parts = ["part5"]
 # parts = ["part1", "part2a"]
-parts = ["part1"]
+parts = ["part1", "part2b", "part3", "part4", "part5","part6"]
+# parts = ["part2a"]
 
 fallen_branches_df_columns = ["part", "tree_index", "essence",
                               "branch_id", "volume", "length",
@@ -39,17 +40,29 @@ min_neighbors = 1
 voxel_size = 0.5
 
 # voxel dbscan
-min_samples = 30
+min_samples = 10
+
+# Root Drive for the data
+current_dir = rf"D:\Karl\hydro\dataset\Working\single_trees"
+
+# Start of the root outdirs, usually the working drive. 
+out_dir = rf"D:\Chris\Hydro\Karl\data"
 
 for part in parts:
+    dest_part = os.path.join(
+        out_dir,
+        f"{part}",
+        "2022"
+    )
+    os.makedirs(dest_part, exist_ok=True)
     
     fallen_branches_rows_for_part = []
     tree_level_rows_for_part = []
 
-    current_dir = os.getcwd()
-    root_path = rf"{current_dir}\data\{part}"
-    trees_2022 = os.path.join(root_path, "2022")
-    trees_2023 = os.path.join(root_path, "2023")
+    # current_dir = os.getcwd()
+    root_path = rf"{current_dir}\{part}"
+    trees_2022 = os.path.join(root_path, "2022", "matched_xyz_species")
+    trees_2023 = os.path.join(root_path, "2023", "matched_xyz_species")
     
     sorted_trees_2022 = sorted([f for f in os.listdir(trees_2022) if f.endswith('.xyz')], 
                                key=lambda x: int(x.split(' ')[2]))
@@ -83,7 +96,7 @@ for part in parts:
     # tree_level_data = pd.read_csv(tree_level_data_path)
 
     tree_indexes = tuple(range(len(sorted_trees_2022)-1))
-    tree_indexes = (0,)
+    # tree_indexes = (0,)
     
     for tree_index in tree_indexes:
         
@@ -95,7 +108,14 @@ for part in parts:
         tree_filename_2023 = os.path.join(trees_2023, sorted_trees_2023[tree_index])               
         print(f'"{tree_filename_2022}"')
         print(f'"{tree_filename_2023}"')
+
+
+        # Load 2022 tree and build KDTree
+        PC_2022 = np.loadtxt(tree_filename_2022)
+        points_2022 = PC_2022[:, :3]  # assuming XYZ in first 3 columns
+        tree_2022 = cKDTree(points_2022)
         
+        # Load 2023 tree and build KDTree
         PC = np.loadtxt(tree_filename_2023)
         tree_2023 = cKDTree(PC)
         
@@ -153,6 +173,11 @@ for part in parts:
             tree2_filename=tree_filename_2023,
             voxel_size=voxel_size
         )
+
+        #Define the minimum reference point:
+
+        ref_min = voxelChangeDetector.ref_min_point
+
         # source if it source = 1 its the 2022 / source
 
         voxel_diff_df = voxelChangeDetector.compare_voxels()
@@ -170,8 +195,8 @@ for part in parts:
         total_branch_volume = 0
         
         if only1_df.shape[0] > 0:
-            start_indices, s_points = points_in_voxels(start_points, connected_df, voxel_size)
-            end_indices, e_points = points_in_voxels(end_points, connected_df, voxel_size)
+            start_indices, s_points = points_in_voxels(start_points, connected_df, voxel_size, ref_min)
+            end_indices, e_points = points_in_voxels(end_points, connected_df, voxel_size, ref_min)
             
             inside_indices = np.union1d(start_indices, end_indices)
             inside_cylinders = cylinders_df.iloc[inside_indices]
@@ -187,7 +212,6 @@ for part in parts:
             # you dont know if the cyclinders are in the branch or trunk it uses the axis id from archi to extract individual branches from the cyclinders
             # if it finds a smaller branch in a larger branch, it will drop the smaller ones
             for axis_id in inside_cylinders['axis_ID'].unique():
-
 
                 branch_df, used_cyl_ids = extract_branch_from_axis(axis_id, 
                                                                    inside_cylinders, 
@@ -277,42 +301,48 @@ for part in parts:
                         distance_along_axis = abs(s_com - s_first)
                         projected_branch_length = abs(s_last - s_first)
                         percent_position = 100 * distance_along_axis / projected_branch_length if projected_branch_length > 0 else np.nan
-                        
-                        if percent_position > 200:
-                            
-                            print("d :")
-                            print(dist_first_last)
-                                                                                    
-                            # # Centroid of start points
-                            # centroid = np.nanmean(coords[:, 0:3], axis=0)
-                            
-                            # # Plot
-                            # fig = plt.figure(figsize=(10, 8))
-                            # ax = fig.add_subplot(111, projection='3d')
-                            
-                            # ax.scatter(com[0], com[1], com[2], color='r', s=30)
-                            
-                            # ax.scatter(start_first[0], start_first[1], start_first[2], color='g', s=30)
-                            # ax.scatter(centers[-1][0], centers[-1][1], centers[-1][2], color='k', s=30)
-                        
-                            # ax.scatter(starts[:, 0], starts[:, 1], starts[:, 2], color='b', s=10)
-                            
-                            # # Average direction vector (plotted in red from centroid)
-                            # ax.quiver(
-                            #     centroid[0], centroid[1], centroid[2],
-                            #     mean_vec_norm[0], mean_vec_norm[1], mean_vec_norm[2],
-                            #     length=0.2, normalize=True, color='red', linewidth=2
-                            # )
-                            
-                            # # Labels
-                            # ax.set_xlabel('X')
-                            # ax.set_ylabel('Y')
-                            # ax.set_zlabel('Z')
-                            # ax.set_title(f'Branch Vectors and Mean Orientation\nAverage Angle = {avg_angle_deg:.2f}\n{percent_position}°')
-                            # plt.tight_layout()
-                            # plt.show()
-                            
-                            # sys.exit()
+
+                        # Save the branch code                       
+                        search_radius = float(valid_branches['radius_cyl'].astype(float).max()) * 1.5
+
+                        # Use all start and end points of the fallen cylinders as query centers
+                        sample_points = np.vstack([starts, ends])  # (2N, 3)
+
+                        branch_point_indices = set()
+                        neighbor_lists = tree_2022.query_ball_point(sample_points, r=search_radius)
+
+                        for neigh in neighbor_lists:
+                            for idx in neigh:
+                                branch_point_indices.add(idx)
+
+                        if branch_point_indices:
+                            branch_point_indices = np.array(sorted(branch_point_indices), dtype=int)
+                            branch_points = points_2022[branch_point_indices, :3]
+
+                        # Change the dest folder to point to the out_dir
+                            dest_folder_points = os.path.join(
+                                dest_part,
+                                "branch_points",
+                                f"tree_{tree_index}"
+                            )
+                            os.makedirs(dest_folder_points, exist_ok=True)
+
+                            xyz_filename = f"{part}_tree_{tree_index_str}_branch_{axis_id}.xyz"
+                            np.savetxt(
+                                os.path.join(dest_folder_points, xyz_filename),
+                                branch_points,
+                                fmt="%.6f"
+                            )
+
+                            # Optional: also write LAZ using laspy (if you want)
+                            import laspy
+                            laz_filename = f"{part}_tree_{tree_index_str}_branch_{axis_id}.laz"
+                            hdr = laspy.LasHeader(point_format=3, version="1.2")
+                            las = laspy.LasData(hdr)
+                            las.x = branch_points[:, 0]
+                            las.y = branch_points[:, 1]
+                            las.z = branch_points[:, 2]
+                            las.write(os.path.join(dest_folder_points, laz_filename))
                         
                         new_row = pd.DataFrame([{
                             "part": part,
@@ -335,7 +365,7 @@ for part in parts:
                         })
                         
                         # np.savetxt(f"branches/cylinders/part_{part}_tree_{tree_index_str}_branch_{axis_id}.txt", starts)
-                        dest_folder_cylinders = os.path.join(root_path, "2022", "branch", "cylinders", f"tree_{tree_index}")
+                        dest_folder_cylinders = os.path.join(dest_part, "branch", "cylinders", f"tree_{tree_index}")
                         os.makedirs(dest_folder_cylinders, exist_ok=True)
                         cylinders_filename = f"{part}_tree_{tree_index_str}_branch_{axis_id}.txt"
                         np.savetxt(os.path.join(dest_folder_cylinders, cylinders_filename), starts)
@@ -346,7 +376,15 @@ for part in parts:
         print(f"lost volume ratio : {lost_volume_ratio}")
     
         print(f"saving {tree_index_str}_true_qsm.csv")
-        cylinders_df.to_csv(os.path.join(adtreeqsm_folder, f"{tree_index_str}_true_qsm.csv"), index=False)
+
+        dest_folder_cylinders = os.path.join(
+            dest_part,
+            "cylinders",
+            f"tree_{tree_index}"
+        )
+        os.makedirs(dest_folder_cylinders, exist_ok=True)
+
+        cylinders_df.to_csv(os.path.join(dest_folder_cylinders, f"{tree_index_str}_true_qsm.csv"), index=False)
         
         tree_level_rows_for_part.append({
             "part": part,
@@ -356,14 +394,16 @@ for part in parts:
         })
         # end of tree loop
     
+    data_dir = os.getcwd()
+
     # Create DataFrames from the collected rows for the current part
     output_fallen_branches_df_part = pd.DataFrame(fallen_branches_rows_for_part, columns=fallen_branches_df_columns)
     output_tree_level_df_part = pd.DataFrame(tree_level_rows_for_part, columns=tree_level_df_columns)
     
     print(f"saving fallen_branch_data_{part}.csv")
-    output_fallen_branches_df_part.to_csv(os.path.join(root_path, f"fallen_branch_data_{part}.csv"), index=False)
+    output_fallen_branches_df_part.to_csv(os.path.join(dest_part, f"fallen_branch_data_{part}.csv"), index=False)
 
     print(f"saving tree_level_data_{part}.csv")
-    output_tree_level_df_part.to_csv(os.path.join(root_path, f"new_volume_tree_level_data_{part}.csv"), index=False)
+    output_tree_level_df_part.to_csv(os.path.join(dest_part, f"new_volume_tree_level_data_{part}.csv"), index=False)
     print("Done.")
 # end of part loop

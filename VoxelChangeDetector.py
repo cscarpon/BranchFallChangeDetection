@@ -24,6 +24,7 @@ class VoxelChangeDetector():
         self._source_counts: DataFrame | None = None
         self._tree1_filename: str | None = None
         self._tree2_filename: str | None = None
+        self._ref_min_point: np.ndarray | None = None
     
     @property
     def dataframe_1(self) -> DataFrame | None:
@@ -73,8 +74,14 @@ class VoxelChangeDetector():
         
         self._df_1 = voxelization1.get_dataframe()
         self._df_2 = voxelization2.get_dataframe()
+
+        self._ref_min_point = ref_min_point
         
         return self._df_1, self._df_2
+    
+    @property
+    def ref_min_point(self) -> np.ndarray | None:
+        return self._ref_min_point
 
 
     def compare_voxels(self) -> DataFrame:
