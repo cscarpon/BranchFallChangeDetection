@@ -60,31 +60,47 @@ def extract_branch_from_axis(axis_id, qsm_df, paths_df, used_cyl_ids):
 
 def points_in_voxels(points, voxel_df, voxel_size, ref_min_point):
     """
-    points: (N,3) world coordinates (your LiDAR points or cylinder endpoints)
+    Fast mapping: point -> voxel index -> membership test.
+
+    points: (N,3) float world coordinates
     voxel_df: DataFrame with integer voxel indices VoxLabel_X/Y/Z
-    voxel_size: voxel edge length, same as in voxelize()
-    ref_min_point: np.array shape (3,), same as voxelize() ref_min_point
+    voxel_size: float
+    ref_min_point: (3,) float
     """
-    labels = voxel_df[["VoxLabel_X", "VoxLabel_Y", "VoxLabel_Z"]].to_numpy().astype(float)
+    if points is None:
+        return np.array([], dtype=int), np.empty((0, 3), dtype=float)
 
-    # Compute voxel min and max in world coordinates
-    voxel_min = ref_min_point + labels * voxel_size
-    voxel_max = voxel_min + voxel_size  # each voxel is a cube of size voxel_size
+    pts = np.asarray(points, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] != 3 or pts.shape[0] == 0:
+        return np.array([], dtype=int), np.empty((0, 3), dtype=float)
 
-    inside_indices = []
-    inside_points = []
+    labels = voxel_df[["VoxLabel_X", "VoxLabel_Y", "VoxLabel_Z"]].to_numpy(dtype=np.int32)
+    if labels.size == 0:
+        return np.array([], dtype=int), np.empty((0, 3), dtype=float)
 
-    for i, point in enumerate(points):
-        inside = np.any(
-            (voxel_min[:, 0] <= point[0]) & (point[0] <= voxel_max[:, 0]) &
-            (voxel_min[:, 1] <= point[1]) & (point[1] <= voxel_max[:, 1]) &
-            (voxel_min[:, 2] <= point[2]) & (point[2] <= voxel_max[:, 2])
-        )
-        if inside:
-            inside_indices.append(i)
-            inside_points.append(point)
+    # Point voxel indices (same grid as voxelization)
+    vox = np.floor((pts - np.asarray(ref_min_point, dtype=np.float64)) / float(voxel_size)).astype(np.int32)
 
-    return np.array(inside_indices), np.array(inside_points)
+    # Hash packing for voxel labels
+    mins = labels.min(axis=0)
+    shifted = labels - mins
+    ranges = shifted.max(axis=0) + 1
+
+    key_labels = (shifted[:, 0].astype(np.int64) +
+                  shifted[:, 1].astype(np.int64) * ranges[0].astype(np.int64) +
+                  shifted[:, 2].astype(np.int64) * (ranges[0].astype(np.int64) * ranges[1].astype(np.int64)))
+    label_set = set(key_labels.tolist())
+
+    vshift = vox - mins
+    key_pts = (vshift[:, 0].astype(np.int64) +
+               vshift[:, 1].astype(np.int64) * ranges[0].astype(np.int64) +
+               vshift[:, 2].astype(np.int64) * (ranges[0].astype(np.int64) * ranges[1].astype(np.int64)))
+
+    inside = np.fromiter((k in label_set for k in key_pts), dtype=bool, count=key_pts.shape[0])
+    idx = np.flatnonzero(inside).astype(int)
+
+    return idx, pts[idx]
+
 
 # def points_in_voxels(points, voxel_df, voxel_size, ref_min_point):
 #     """

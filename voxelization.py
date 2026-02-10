@@ -2,7 +2,6 @@ from typing import Any, Optional
 import numpy as np
 from pandas import DataFrame
 import os
-import open3d as o3d # type: ignore
 import laspy as lp # type: ignore
 import json
 from typing import Any
