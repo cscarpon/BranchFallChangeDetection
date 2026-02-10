@@ -24,6 +24,7 @@ class VoxelChangeDetector():
         self._source_counts: DataFrame | None = None
         self._tree1_filename: str | None = None
         self._tree2_filename: str | None = None
+        self._ref_min_point: np.ndarray | None = None
     
     @property
     def dataframe_1(self) -> DataFrame | None:
@@ -73,8 +74,14 @@ class VoxelChangeDetector():
         
         self._df_1 = voxelization1.get_dataframe()
         self._df_2 = voxelization2.get_dataframe()
+
+        self._ref_min_point = ref_min_point
         
         return self._df_1, self._df_2
+    
+    @property
+    def ref_min_point(self) -> np.ndarray | None:
+        return self._ref_min_point
 
 
     def compare_voxels(self) -> DataFrame:
@@ -175,6 +182,99 @@ class VoxelChangeDetector():
         ]
         
         return merged_df[columns_of_interest]
+    
+    @staticmethod
+    def _unique_rows_int32(a: np.ndarray) -> np.ndarray:
+        a = np.asarray(a, dtype=np.int32)
+        if a.size == 0:
+            return a.reshape(0, 3)
+        view = a.view([("x", np.int32), ("y", np.int32), ("z", np.int32)])
+        uniq = np.unique(view).view(np.int32).reshape(-1, 3)
+        return uniq
+
+    @staticmethod
+    def _dilate_labels(labels_xyz: np.ndarray, r: int) -> np.ndarray:
+        """
+        labels_xyz: (M,3) int voxel indices
+        r: dilation radius in voxels
+        returns: (K,3) int expanded + unique
+        """
+        labels_xyz = np.asarray(labels_xyz, dtype=np.int32)
+        if r <= 0 or labels_xyz.size == 0:
+            return labels_xyz.reshape(-1, 3)
+
+        offsets = np.array(
+            [(dx, dy, dz)
+            for dx in range(-r, r + 1)
+            for dy in range(-r, r + 1)
+            for dz in range(-r, r + 1)],
+            dtype=np.int32
+        )
+        expanded = (labels_xyz[:, None, :] + offsets[None, :, :]).reshape(-1, 3)
+        return VoxelChangeDetector._unique_rows_int32(expanded)
+
+    @staticmethod
+    def missing_tree1_voxels(df1: pd.DataFrame, df2: pd.DataFrame, dilation_voxels: int = 0) -> pd.DataFrame:
+        """
+        Return voxels occupied in df1 that are NOT matched by df2 within dilation.
+        Output columns: VoxLabel_X/Y/Z, NbPoints_1, NbPoints_2, Source (like compare_voxels output)
+        """
+        L1 = df1[["VoxLabel_X","VoxLabel_Y","VoxLabel_Z"]].to_numpy(dtype=np.int32)
+        L2 = df2[["VoxLabel_X","VoxLabel_Y","VoxLabel_Z"]].to_numpy(dtype=np.int32)
+
+        if L1.size == 0:
+            return pd.DataFrame(columns=["VoxLabel_X","VoxLabel_Y","VoxLabel_Z","NbPoints_1","NbPoints_2","Source"])
+
+        if L2.size == 0:
+            return pd.DataFrame({
+                "VoxLabel_X": L1[:,0],
+                "VoxLabel_Y": L1[:,1],
+                "VoxLabel_Z": L1[:,2],
+                "NbPoints_1": df1["NbPoints"].to_numpy(dtype=np.int32),
+                "NbPoints_2": 0,
+                "Source": "1",
+            })
+
+        # dilate L2 in voxel space
+        r = int(dilation_voxels)
+        if r > 0:
+            offsets = np.array([(dx,dy,dz) for dx in range(-r,r+1) for dy in range(-r,r+1) for dz in range(-r,r+1)], dtype=np.int32)
+            L2 = (L2[:,None,:] + offsets[None,:,:]).reshape(-1,3)
+
+            # unique rows
+            view = L2.view([("x",np.int32),("y",np.int32),("z",np.int32)])
+            L2 = np.unique(view).view(np.int32).reshape(-1,3)
+
+        # hash set membership for L2
+        mins = L2.min(axis=0)
+        shifted2 = L2 - mins
+        ranges = shifted2.max(axis=0) + 1
+
+        key2 = (shifted2[:,0].astype(np.int64) +
+                shifted2[:,1].astype(np.int64) * ranges[0].astype(np.int64) +
+                shifted2[:,2].astype(np.int64) * (ranges[0].astype(np.int64) * ranges[1].astype(np.int64)))
+        set2 = set(key2.tolist())
+
+        shifted1 = L1 - mins
+        key1 = (shifted1[:,0].astype(np.int64) +
+                shifted1[:,1].astype(np.int64) * ranges[0].astype(np.int64) +
+                shifted1[:,2].astype(np.int64) * (ranges[0].astype(np.int64) * ranges[1].astype(np.int64)))
+
+        missing_mask = np.fromiter((k not in set2 for k in key1), dtype=bool, count=key1.shape[0])
+
+        miss = L1[missing_mask]
+        nb1 = df1.loc[missing_mask, "NbPoints"].to_numpy(dtype=np.int32)
+
+        return pd.DataFrame({
+            "VoxLabel_X": miss[:,0],
+            "VoxLabel_Y": miss[:,1],
+            "VoxLabel_Z": miss[:,2],
+            "NbPoints_1": nb1,
+            "NbPoints_2": 0,
+            "Source": "1",
+        })
+
+
 
   
     @classmethod

@@ -58,81 +58,153 @@ def extract_branch_from_axis(axis_id, qsm_df, paths_df, used_cyl_ids):
 
     return branch_df, used_cyl_ids
 
-def points_in_voxels(points, voxel_df, voxel_size):
+def points_in_voxels(points, voxel_df, voxel_size, ref_min_point):
     """
-    Filter points within voxel boundaries.
+    Fast mapping: point -> voxel index -> membership test.
 
-    Parameters
-    ----------
-    points : array-like, shape (N, 3)
-        Point coordinates in the same physical coordinate system as the voxels.
-    voxel_df : pandas.DataFrame
-        DataFrame describing voxels. It may contain voxel locations in one of
-        these forms:
-          - 'X', 'Y', 'Z'
-          - 'X_1', 'Y_1', 'Z_1'
-          - 'VoxPos_X_1', 'VoxPos_Y_1', 'VoxPos_Z_1'
-          - 'VoxPos_X', 'VoxPos_Y', 'VoxPos_Z'
-          - 'VoxLabel_X', 'VoxLabel_Y', 'VoxLabel_Z' (integer indices)
-    voxel_size : float
-        Edge length of a voxel, in the same units as `points` coordinates.
+    points: (N,3) float world coordinates
+    voxel_df: DataFrame with integer voxel indices VoxLabel_X/Y/Z
+    voxel_size: float
+    ref_min_point: (3,) float
     """
-    voxel_df = voxel_df.copy()
+    if points is None:
+        return np.array([], dtype=int), np.empty((0, 3), dtype=float)
 
-    # First, normalize older naming convention X_1/Y_1/Z_1 → X/Y/Z
-    rename_map = {"X_1": "X", "Y_1": "Y", "Z_1": "Z"}
-    voxel_df.rename(columns={k: v for k, v in rename_map.items() if k in voxel_df.columns},
-                    inplace=True)
+    pts = np.asarray(points, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] != 3 or pts.shape[0] == 0:
+        return np.array([], dtype=int), np.empty((0, 3), dtype=float)
 
-    # Decide which coordinate columns to use
-    cols_xyz      = ['X', 'Y', 'Z']
-    cols_suffix_1 = ['VoxPos_X_1', 'VoxPos_Y_1', 'VoxPos_Z_1']
-    cols_base     = ['VoxPos_X',   'VoxPos_Y',   'VoxPos_Z']
-    cols_label    = ['VoxLabel_X', 'VoxLabel_Y', 'VoxLabel_Z']
+    labels = voxel_df[["VoxLabel_X", "VoxLabel_Y", "VoxLabel_Z"]].to_numpy(dtype=np.int32)
+    if labels.size == 0:
+        return np.array([], dtype=int), np.empty((0, 3), dtype=float)
 
-    if all(c in voxel_df.columns for c in cols_xyz):
-        # Already in physical coordinates
-        voxel_coords = voxel_df[cols_xyz].values.astype(float)
+    # Point voxel indices (same grid as voxelization)
+    vox = np.floor((pts - np.asarray(ref_min_point, dtype=np.float64)) / float(voxel_size)).astype(np.int32)
 
-    elif all(c in voxel_df.columns for c in cols_suffix_1):
-        voxel_coords = voxel_df[cols_suffix_1].values.astype(float)
+    # Hash packing for voxel labels
+    mins = labels.min(axis=0)
+    shifted = labels - mins
+    ranges = shifted.max(axis=0) + 1
 
-    elif all(c in voxel_df.columns for c in cols_base):
-        voxel_coords = voxel_df[cols_base].values.astype(float)
+    key_labels = (shifted[:, 0].astype(np.int64) +
+                  shifted[:, 1].astype(np.int64) * ranges[0].astype(np.int64) +
+                  shifted[:, 2].astype(np.int64) * (ranges[0].astype(np.int64) * ranges[1].astype(np.int64)))
+    label_set = set(key_labels.tolist())
 
-    elif all(c in voxel_df.columns for c in cols_label):
-        # Integer voxel indices → convert to physical coordinates
-        voxel_coords = voxel_df[cols_label].values.astype(float) * float(voxel_size)
+    vshift = vox - mins
+    key_pts = (vshift[:, 0].astype(np.int64) +
+               vshift[:, 1].astype(np.int64) * ranges[0].astype(np.int64) +
+               vshift[:, 2].astype(np.int64) * (ranges[0].astype(np.int64) * ranges[1].astype(np.int64)))
 
-    else:
-        raise KeyError(
-            "points_in_voxels: could not find voxel coordinate columns.\n"
-            f"Expected one of:\n"
-            f"  {cols_xyz}\n"
-            f"  {cols_suffix_1}\n"
-            f"  {cols_base}\n"
-            f"  {cols_label}\n"
-            f"but got:\n{list(voxel_df.columns)}"
-        )
+    inside = np.fromiter((k in label_set for k in key_pts), dtype=bool, count=key_pts.shape[0])
+    idx = np.flatnonzero(inside).astype(int)
 
-    # Now do the same bounding-box test as your original implementation
-    voxel_min = voxel_coords - voxel_size / 2.0
-    voxel_max = voxel_coords + voxel_size / 2.0
+    return idx, pts[idx]
 
-    inside_points = []
-    inside_indices = []
 
-    for i, point in enumerate(points):
-        inside = np.any(
-            (voxel_min[:, 0] <= point[0]) & (point[0] <= voxel_max[:, 0]) &
-            (voxel_min[:, 1] <= point[1]) & (point[1] <= voxel_max[:, 1]) &
-            (voxel_min[:, 2] <= point[2]) & (point[2] <= voxel_max[:, 2])
-        )
-        if inside:
-            inside_indices.append(i)
-            inside_points.append(point)
+# def points_in_voxels(points, voxel_df, voxel_size, ref_min_point):
+#     """
+#     points: (N,3) world coordinates (your LiDAR points or cylinder endpoints)
+#     voxel_df: DataFrame with integer voxel indices VoxLabel_X/Y/Z
+#     voxel_size: voxel edge length, same as in voxelize()
+#     ref_min_point: np.array shape (3,), same as voxelize() ref_min_point
+#     """
+#     labels = voxel_df[["VoxLabel_X", "VoxLabel_Y", "VoxLabel_Z"]].to_numpy().astype(float)
 
-    return np.array(inside_indices), np.array(inside_points)
+#     # Compute voxel min and max in world coordinates
+#     voxel_min = ref_min_point + labels * voxel_size
+#     voxel_max = voxel_min + voxel_size  # each voxel is a cube of size voxel_size
+
+#     inside_indices = []
+#     inside_points = []
+
+#     for i, point in enumerate(points):
+#         inside = np.any(
+#             (voxel_min[:, 0] <= point[0]) & (point[0] <= voxel_max[:, 0]) &
+#             (voxel_min[:, 1] <= point[1]) & (point[1] <= voxel_max[:, 1]) &
+#             (voxel_min[:, 2] <= point[2]) & (point[2] <= voxel_max[:, 2])
+#         )
+#         if inside:
+#             inside_indices.append(i)
+#             inside_points.append(point)
+
+#     return np.array(inside_indices), np.array(inside_points)
+
+# def points_in_voxels(points, voxel_df, voxel_size):
+#     """
+#     Filter points within voxel boundaries.
+
+#     Parameters
+#     ----------
+#     points : array-like, shape (N, 3)
+#         Point coordinates in the same physical coordinate system as the voxels.
+#     voxel_df : pandas.DataFrame
+#         DataFrame describing voxels. It may contain voxel locations in one of
+#         these forms:
+#           - 'X', 'Y', 'Z'
+#           - 'X_1', 'Y_1', 'Z_1'
+#           - 'VoxPos_X_1', 'VoxPos_Y_1', 'VoxPos_Z_1'
+#           - 'VoxPos_X', 'VoxPos_Y', 'VoxPos_Z'
+#           - 'VoxLabel_X', 'VoxLabel_Y', 'VoxLabel_Z' (integer indices)
+#     voxel_size : float
+#         Edge length of a voxel, in the same units as `points` coordinates.
+#     """
+#     voxel_df = voxel_df.copy()
+
+#     # First, normalize older naming convention X_1/Y_1/Z_1 → X/Y/Z
+#     rename_map = {"X_1": "X", "Y_1": "Y", "Z_1": "Z"}
+#     voxel_df.rename(columns={k: v for k, v in rename_map.items() if k in voxel_df.columns},
+#                     inplace=True)
+
+#     # Decide which coordinate columns to use
+#     cols_xyz      = ['X', 'Y', 'Z']
+#     cols_suffix_1 = ['VoxPos_X_1', 'VoxPos_Y_1', 'VoxPos_Z_1']
+#     cols_base     = ['VoxPos_X',   'VoxPos_Y',   'VoxPos_Z']
+#     cols_label    = ['VoxLabel_X', 'VoxLabel_Y', 'VoxLabel_Z']
+
+#     if all(c in voxel_df.columns for c in cols_xyz):
+#         # Already in physical coordinates
+#         voxel_coords = voxel_df[cols_xyz].values.astype(float)
+
+#     elif all(c in voxel_df.columns for c in cols_suffix_1):
+#         voxel_coords = voxel_df[cols_suffix_1].values.astype(float)
+
+#     elif all(c in voxel_df.columns for c in cols_base):
+#         voxel_coords = voxel_df[cols_base].values.astype(float)
+
+#     elif all(c in voxel_df.columns for c in cols_label):
+#         # Integer voxel indices → convert to physical coordinates
+#         voxel_coords = voxel_df[cols_label].values.astype(float) * float(voxel_size)
+
+#     else:
+#         raise KeyError(
+#             "points_in_voxels: could not find voxel coordinate columns.\n"
+#             f"Expected one of:\n"
+#             f"  {cols_xyz}\n"
+#             f"  {cols_suffix_1}\n"
+#             f"  {cols_base}\n"
+#             f"  {cols_label}\n"
+#             f"but got:\n{list(voxel_df.columns)}"
+#         )
+
+#     # Now do the same bounding-box test as your original implementation
+#     voxel_min = voxel_coords - voxel_size / 2.0
+#     voxel_max = voxel_coords + voxel_size / 2.0
+
+#     inside_points = []
+#     inside_indices = []
+
+#     for i, point in enumerate(points):
+#         inside = np.any(
+#             (voxel_min[:, 0] <= point[0]) & (point[0] <= voxel_max[:, 0]) &
+#             (voxel_min[:, 1] <= point[1]) & (point[1] <= voxel_max[:, 1]) &
+#             (voxel_min[:, 2] <= point[2]) & (point[2] <= voxel_max[:, 2])
+#         )
+#         if inside:
+#             inside_indices.append(i)
+#             inside_points.append(point)
+
+#     return np.array(inside_indices), np.array(inside_points)
 
 def original_points_in_voxels(tree1_filename, adjacent_df, voxel_size):
     """
