@@ -1,11 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-Created on 2026-02-09
+BranchesChange:
+- Optional ICP alignment (2023 -> 2022) using Open3D
+- DBH + height metrics written
+- Tunable min_branch_length_m
+- connect_to_parent: grow upward to larger limb
+- capture_descendants: absorb all children below the limb
+- split_units_by_branch_id: optional splitting (default False)
+- merge_by_parent_branch: merges fragmented units into the largest parent limb (default True)
+- Fixes XYZ overwriting by using unique unit_key in filename
+- Writes: fallen_branches.csv, intact_branches.csv, tree_level.csv, failures.csv
 
-@author: cscarpon
+ADDED (branch position metrics relative to tree):
+- branch_base_z_m, branch_base_height_ratio
+- branch_com_z_m, branch_com_height_ratio
+- branch_base_xy_dist_to_tree_centroid_m, branch_com_xy_dist_to_tree_centroid_m
+- branch_base_stem_dist_m, branch_com_stem_dist_m (distance to stem axis in XY)
+- outer_canopy_ratio (COM radial distance / crown_r95)
 """
 
-import os
 import glob
 from pathlib import Path
 
@@ -13,8 +26,11 @@ import numpy as np
 import pandas as pd
 from scipy.spatial import cKDTree
 
+import open3d as o3d
+
 from VoxelChangeDetector import VoxelChangeDetector
 from tools import dbscan_connectivity, points_in_voxels
+
 
 class BranchesChange:
     def __init__(
@@ -29,59 +45,117 @@ class BranchesChange:
         min_samples: int = 10,
         voxel_dilation: int = 0,
         flush_every: int = 1,
+        min_branch_length_m: float = 1.0,
+        # ICP
+        do_icp: bool = True,
+        icp_voxel: float = 0.05,
+        icp_max_corr: float = 0.25,
+        icp_max_iters: int = 60,
+        icp_use_point_to_plane: bool = True,
+        # Upward/downward logic
+        connect_to_parent: bool = True,
+        parent_steps_max: int = 200,
+        stop_at_present_parent: bool = True,
+        capture_descendants: bool = True,
+        stop_at_present_descendant: bool = True,
+        # NEW
+        split_units_by_branch_id: bool = False,
+        merge_by_parent_branch: bool = True,
+        # Save XYZ for fallen units
+        save_fallen_xyz: bool = True,
     ):
         self.in_dir_src = Path(in_dir_src)
         self.in_dir_target = Path(in_dir_target)
         self.qsm_dir = Path(qsm_dir)
         self.out_dir = Path(out_dir)
+        self.out_dir.mkdir(parents=True, exist_ok=True)
 
         self.radius = float(radius)
         self.min_neighbors = int(min_neighbors)
         self.voxel_size = float(voxel_size)
         self.min_samples = int(min_samples)
-        self.flush_every = int(flush_every)
         self.voxel_dilation = int(voxel_dilation)
-        self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.flush_every = int(flush_every)
+        self.min_branch_length_m = float(min_branch_length_m)
 
-        # output paths
+        self.do_icp = bool(do_icp)
+        self.icp_voxel = float(icp_voxel)
+        self.icp_max_corr = float(icp_max_corr)
+        self.icp_max_iters = int(icp_max_iters)
+        self.icp_use_point_to_plane = bool(icp_use_point_to_plane)
+
+        self.connect_to_parent = bool(connect_to_parent)
+        self.parent_steps_max = int(parent_steps_max)
+        self.stop_at_present_parent = bool(stop_at_present_parent)
+
+        self.capture_descendants = bool(capture_descendants)
+        self.stop_at_present_descendant = bool(stop_at_present_descendant)
+
+        self.split_units_by_branch_id = bool(split_units_by_branch_id)
+        self.merge_by_parent_branch = bool(merge_by_parent_branch)
+        self.save_fallen_xyz = bool(save_fallen_xyz)
+
         self.fallen_out = self.out_dir / "fallen_branches.csv"
+        self.intact_out = self.out_dir / "intact_branches.csv"
         self.tree_out = self.out_dir / "tree_level.csv"
         self.fail_out = self.out_dir / "failures.csv"
 
-        # Fixed column sets so incremental writes are stable
-        self.fallen_cols = [
-            "tree_index", "tree_folder", "branch_id",
+        # ----------------------------
+        # ADDED: Branch position metrics columns
+        # ----------------------------
+        self.pos_cols = [
+            "branch_base_z_m",
+            "branch_base_height_ratio",
+            "branch_com_z_m",
+            "branch_com_height_ratio",
+            "branch_base_xy_dist_to_tree_centroid_m",
+            "branch_com_xy_dist_to_tree_centroid_m",
+            "branch_base_stem_dist_m",
+            "branch_com_stem_dist_m",
+            "outer_canopy_ratio",
+        ]
+
+        # Branch outputs include parent/child stats for transparency
+        self.branch_cols = [
+            "tree_index", "tree_folder",
+            "parent_branch_id",
+            "n_child_branches", "child_branch_ids",
             "volume", "length", "surface", "max_radius",
             "angle", "origin2com",
             "dir_dx", "dir_dy", "dir_dz",
             "azimuth_deg", "inclination_deg",
             "dbh_m", "height_m",
             "lost_volume_ratio",
+            "unit_key",     # stable unique key per saved unit
             "saved_xyz",
-        ]
+        ] + self.pos_cols
 
         self.tree_cols = [
             "tree_index", "tree_folder",
             "lost_volume_ratio",
             "dbh_m", "dbh_n_cyl",
             "height_m",
-            "n_cylinders", "n_fallen_branches",
+            "n_cylinders",
+            "n_fallen_units",
+            "n_fallen_parent_branches",
+            "icp_fitness", "icp_inlier_rmse",
         ]
 
         self.fail_cols = ["tree_index", "tree_folder", "err"]
 
-        # Initialize files with headers (overwrite existing)
-        pd.DataFrame(columns=self.fallen_cols).to_csv(self.fallen_out, index=False)
+        pd.DataFrame(columns=self.branch_cols).to_csv(self.fallen_out, index=False)
+        pd.DataFrame(columns=self.branch_cols).to_csv(self.intact_out, index=False)
         pd.DataFrame(columns=self.tree_cols).to_csv(self.tree_out, index=False)
         pd.DataFrame(columns=self.fail_cols).to_csv(self.fail_out, index=False)
 
         print("[INFO] Writing incrementally to:")
         print(" ", self.fallen_out)
+        print(" ", self.intact_out)
         print(" ", self.tree_out)
         print(" ", self.fail_out)
 
     # ----------------------------
-    # Input parsing
+    # IO helpers
     # ----------------------------
     @staticmethod
     def _tree_index_str(filename: str) -> str:
@@ -92,7 +166,6 @@ class BranchesChange:
 
     @staticmethod
     def _read_xyz_first3(path: str) -> np.ndarray:
-        # robust reader: handles junk/header/mixed whitespace
         df = pd.read_csv(path, header=None, sep=r"\s+", engine="python", dtype=str)
         if df.shape[1] < 3:
             raise ValueError(f"XYZ file has < 3 columns: {path}")
@@ -100,6 +173,63 @@ class BranchesChange:
         xyz = xyz[np.isfinite(xyz).all(axis=1)]
         return xyz
 
+    @staticmethod
+    def _safe_numeric_xyz(arr: np.ndarray) -> np.ndarray:
+        arr = np.asarray(arr, dtype=np.float64)
+        ok = np.isfinite(arr).all(axis=1)
+        return arr[ok]
+
+    @staticmethod
+    def _to_o3d(xyz: np.ndarray) -> o3d.geometry.PointCloud:
+        p = o3d.geometry.PointCloud()
+        p.points = o3d.utility.Vector3dVector(np.asarray(xyz, dtype=np.float64))
+        return p
+
+    @staticmethod
+    def _write_xyz(path: Path, xyz: np.ndarray):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.savetxt(path, np.asarray(xyz, dtype=float), fmt="%.6f")
+
+    def _icp_align_2023_to_2022(self, pts_2022: np.ndarray, pts_2023: np.ndarray):
+        if pts_2022.shape[0] < 50 or pts_2023.shape[0] < 50:
+            T = np.eye(4, dtype=float)
+            return pts_2023, T, np.nan, np.nan
+
+        src = self._to_o3d(pts_2023)
+        tgt = self._to_o3d(pts_2022)
+
+        v = float(self.icp_voxel)
+        max_corr = float(self.icp_max_corr)
+
+        src_d = src.voxel_down_sample(v) if v > 0 else src
+        tgt_d = tgt.voxel_down_sample(v) if v > 0 else tgt
+
+        if self.icp_use_point_to_plane:
+            rad = max(2.5 * v, 0.05) if v > 0 else 0.10
+            tgt_d.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=rad, max_nn=30))
+            src_d.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=rad, max_nn=30))
+            est = o3d.pipelines.registration.TransformationEstimationPointToPlane()
+        else:
+            est = o3d.pipelines.registration.TransformationEstimationPointToPoint()
+
+        criteria = o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=int(self.icp_max_iters))
+        init = np.eye(4, dtype=float)
+
+        reg = o3d.pipelines.registration.registration_icp(
+            src_d, tgt_d,
+            max_correspondence_distance=max_corr,
+            init=init,
+            estimation_method=est,
+            criteria=criteria,
+        )
+
+        T = np.asarray(reg.transformation, dtype=float)
+        pts_2023_aligned = (pts_2023 @ T[:3, :3].T) + T[:3, 3]
+        return pts_2023_aligned, T, float(reg.fitness), float(reg.inlier_rmse)
+
+    # ----------------------------
+    # rTwig parsing
+    # ----------------------------
     def _load_rtwig_cylinders(self, tree_index_str: str) -> pd.DataFrame:
         patt = str(self.qsm_dir / f"arbre 2022 {tree_index_str} *" / "*_branches_cylinders_corrected.csv")
         hits = glob.glob(patt)
@@ -109,7 +239,6 @@ class BranchesChange:
         cyl_path = hits[0]
         cyl = pd.read_csv(cyl_path)
 
-        # normalize columns
         rename = {
             "start_x": "startX", "start_y": "startY", "start_z": "startZ",
             "end_x": "endX", "end_y": "endY", "end_z": "endZ",
@@ -119,7 +248,10 @@ class BranchesChange:
         }
         cyl = cyl.rename(columns={k: v for k, v in rename.items() if k in cyl.columns})
 
-        required = ["startX", "startY", "startZ", "endX", "endY", "endZ", "cyl_ID", "parent_ID", "radius_cyl", "length", "branch", "branch_order"]
+        required = [
+            "startX", "startY", "startZ", "endX", "endY", "endZ",
+            "cyl_ID", "parent_ID", "radius_cyl", "length", "branch", "branch_order"
+        ]
         missing = [c for c in required if c not in cyl.columns]
         if missing:
             raise ValueError(f"rTwig cylinder file missing columns {missing} in {cyl_path}")
@@ -143,45 +275,348 @@ class BranchesChange:
         return cyl
 
     # ----------------------------
+    # ADDED: Branch position metrics helpers
+    # ----------------------------
+    @staticmethod
+    def _pca_axis(points_xyz: np.ndarray):
+        pts = np.asarray(points_xyz, dtype=float)
+        pts = pts[np.isfinite(pts).all(axis=1)]
+        if pts.shape[0] < 2:
+            return np.full(3, np.nan), np.full(3, np.nan)
+        mu = pts.mean(axis=0)
+        X = pts - mu
+        C = (X.T @ X) / max(1, X.shape[0] - 1)
+        w, v = np.linalg.eigh(C)
+        axis = v[:, np.argmax(w)]
+        n = float(np.linalg.norm(axis))
+        if n <= 0 or not np.isfinite(n):
+            return mu, np.full(3, np.nan)
+        return mu, axis / n
+
+    @staticmethod
+    def _tree_xy_centroid_from_cyl(cylinders_df: pd.DataFrame) -> np.ndarray:
+        s = cylinders_df[["startX", "startY", "startZ"]].to_numpy(dtype=float)
+        e = cylinders_df[["endX", "endY", "endZ"]].to_numpy(dtype=float)
+        centers = 0.5 * (s + e)
+        xy = centers[:, :2]
+        ok = np.isfinite(xy).all(axis=1)
+        return xy[ok].mean(axis=0) if np.any(ok) else np.array([np.nan, np.nan], dtype=float)
+
+    @staticmethod
+    def _crown_r95_xy(points_2022: np.ndarray, tree_xy_centroid: np.ndarray) -> float:
+        pts = np.asarray(points_2022, dtype=float)
+        if pts.shape[0] == 0 or not np.isfinite(tree_xy_centroid).all():
+            return np.nan
+        d = np.linalg.norm(pts[:, :2] - tree_xy_centroid[None, :], axis=1)
+        d = d[np.isfinite(d)]
+        return float(np.quantile(d, 0.95)) if d.size else np.nan
+
+    @staticmethod
+    def _dist_point_to_line_xy(p_xy: np.ndarray, line_p_xy: np.ndarray, line_u_xy: np.ndarray) -> float:
+        p = np.asarray(p_xy, dtype=float)
+        a = np.asarray(line_p_xy, dtype=float)
+        u = np.asarray(line_u_xy, dtype=float)
+        if not np.isfinite(p).all() or not np.isfinite(a).all() or not np.isfinite(u).all():
+            return np.nan
+        nu = float(np.linalg.norm(u))
+        if nu <= 0 or not np.isfinite(nu):
+            return np.nan
+        u = u / nu
+        ap = p - a
+        return float(abs(ap[0] * u[1] - ap[1] * u[0]))
+
+    def _ordered_centers(self, df: pd.DataFrame) -> np.ndarray:
+        if df.empty:
+            return np.zeros((0, 3), dtype=float)
+
+        if "base_distance" in df.columns and df["base_distance"].notna().any():
+            dd = pd.to_numeric(df["base_distance"], errors="coerce").to_numpy()
+            dfo = df.iloc[np.argsort(dd)].copy()
+        elif "growth_length" in df.columns and df["growth_length"].notna().any():
+            dd = pd.to_numeric(df["growth_length"], errors="coerce").to_numpy()
+            dfo = df.iloc[np.argsort(dd)].copy()
+        else:
+            dfo = df.sort_values("cyl_ID").copy()
+
+        s = dfo[["startX", "startY", "startZ"]].to_numpy(dtype=float)
+        e = dfo[["endX", "endY", "endZ"]].to_numpy(dtype=float)
+        centers = 0.5 * (s + e)
+        centers = centers[np.isfinite(centers).all(axis=1)]
+        return centers
+
+    def _branch_position_metrics(
+        self,
+        unit_df: pd.DataFrame,
+        z0: float,
+        height_m: float,
+        tree_xy_centroid: np.ndarray,
+        crown_r95: float,
+        stem_p0_xyz: np.ndarray,
+        stem_u_xyz: np.ndarray,
+    ) -> dict:
+        centers = self._ordered_centers(unit_df)
+        if centers.shape[0] == 0:
+            return {k: np.nan for k in self.pos_cols}
+
+        base = centers[0]
+
+        # COM: volume-weighted over cylinder centers (fallback unweighted)
+        vols = pd.to_numeric(unit_df["volume"], errors="coerce").to_numpy(dtype=float)
+        vols = np.where(np.isfinite(vols) & (vols > 0), vols, 0.0)
+        if vols.size == centers.shape[0] and float(vols.sum()) > 0:
+            com = (centers * vols[:, None]).sum(axis=0) / float(vols.sum())
+        else:
+            com = centers.mean(axis=0)
+
+        base_z = float(base[2])
+        com_z = float(com[2])
+
+        if np.isfinite(z0) and np.isfinite(height_m) and height_m > 0:
+            base_hr = float((base_z - z0) / height_m)
+            com_hr = float((com_z - z0) / height_m)
+        else:
+            base_hr, com_hr = np.nan, np.nan
+
+        if np.isfinite(tree_xy_centroid).all():
+            base_xy_d = float(np.linalg.norm(base[:2] - tree_xy_centroid))
+            com_xy_d = float(np.linalg.norm(com[:2] - tree_xy_centroid))
+        else:
+            base_xy_d, com_xy_d = np.nan, np.nan
+
+        if np.isfinite(stem_p0_xyz).all() and np.isfinite(stem_u_xyz).all():
+            base_stem_d = self._dist_point_to_line_xy(base[:2], stem_p0_xyz[:2], stem_u_xyz[:2])
+            com_stem_d = self._dist_point_to_line_xy(com[:2], stem_p0_xyz[:2], stem_u_xyz[:2])
+        else:
+            base_stem_d, com_stem_d = np.nan, np.nan
+
+        if np.isfinite(crown_r95) and crown_r95 > 0 and np.isfinite(com_xy_d):
+            outer = float(com_xy_d / crown_r95)
+        else:
+            outer = np.nan
+
+        return {
+            "branch_base_z_m": base_z,
+            "branch_base_height_ratio": base_hr,
+            "branch_com_z_m": com_z,
+            "branch_com_height_ratio": com_hr,
+            "branch_base_xy_dist_to_tree_centroid_m": base_xy_d,
+            "branch_com_xy_dist_to_tree_centroid_m": com_xy_d,
+            "branch_base_stem_dist_m": base_stem_d,
+            "branch_com_stem_dist_m": com_stem_d,
+            "outer_canopy_ratio": outer,
+        }
+
+    # ----------------------------
+    # Metrics helpers
+    # ----------------------------
+    def _branch_direction(self, df: pd.DataFrame):
+        if df.empty:
+            return (np.nan, np.nan, np.nan, np.nan, np.nan)
+
+        if "base_distance" in df.columns and df["base_distance"].notna().any():
+            dd = pd.to_numeric(df["base_distance"], errors="coerce")
+            dfo = df.iloc[np.argsort(dd.to_numpy())].copy()
+        elif "growth_length" in df.columns and df["growth_length"].notna().any():
+            dd = pd.to_numeric(df["growth_length"], errors="coerce")
+            dfo = df.iloc[np.argsort(dd.to_numpy())].copy()
+        else:
+            dfo = df.sort_values("cyl_ID").copy()
+
+        s = dfo[["startX", "startY", "startZ"]].to_numpy(dtype=float)
+        e = dfo[["endX", "endY", "endZ"]].to_numpy(dtype=float)
+        centers = 0.5 * (s + e)
+
+        v = centers[-1] - centers[0]
+        dx, dy, dz = float(v[0]), float(v[1]), float(v[2])
+
+        az = (np.degrees(np.arctan2(dy, dx)) + 360.0) % 360.0
+        horiz = np.hypot(dx, dy)
+        inc = np.degrees(np.arctan2(dz, horiz))
+        return (dx, dy, dz, float(az), float(inc))
+
+    @staticmethod
+    def _origin2com(df: pd.DataFrame) -> float:
+        if df.empty:
+            return np.nan
+
+        s2 = df[["startX", "startY", "startZ"]].to_numpy(dtype=float)
+        e2 = df[["endX", "endY", "endZ"]].to_numpy(dtype=float)
+        centers = 0.5 * (s2 + e2)
+
+        if "base_distance" in df.columns and df["base_distance"].notna().any():
+            ordv = pd.to_numeric(df["base_distance"], errors="coerce").to_numpy()
+            order = np.argsort(ordv)
+        elif "growth_length" in df.columns and df["growth_length"].notna().any():
+            ordv = pd.to_numeric(df["growth_length"], errors="coerce").to_numpy()
+            order = np.argsort(ordv)
+        else:
+            order = np.argsort(pd.to_numeric(df["cyl_ID"], errors="coerce").to_numpy())
+
+        centers_o = centers[order]
+        first_center = centers_o[0]
+        last_center = centers_o[-1]
+        axis_vec = last_center - first_center
+        axis_len = float(np.linalg.norm(axis_vec))
+        if axis_len <= 0:
+            return np.nan
+
+        axis_u = axis_vec / axis_len
+        vols = pd.to_numeric(df["volume"], errors="coerce").to_numpy(dtype=float)
+        vols = np.where(np.isfinite(vols) & (vols > 0), vols, 0.0)
+        vtot = float(np.sum(vols))
+        if vtot <= 0:
+            return np.nan
+
+        com = (centers * vols[:, None]).sum(axis=0) / vtot
+        s_first = float(first_center @ axis_u)
+        s_last = float(last_center @ axis_u)
+        s_com = float(com @ axis_u)
+        denom2 = abs(s_last - s_first)
+        return float(100.0 * abs(s_com - s_first) / denom2) if denom2 > 0 else np.nan
+
+    def _surface_area(self, df: pd.DataFrame) -> float:
+        if "surface_area_m2" in df.columns:
+            return float(pd.to_numeric(df["surface_area_m2"], errors="coerce").sum())
+        r = pd.to_numeric(df["radius_cyl"], errors="coerce").to_numpy(dtype=float)
+        L = pd.to_numeric(df["length"], errors="coerce").to_numpy(dtype=float)
+        return float(np.nansum(2.0 * np.pi * r * L))
+
+    def _angle_from_vertical(self, df: pd.DataFrame) -> float:
+        if "angle_from_vertical_deg" not in df.columns:
+            return np.nan
+        w = pd.to_numeric(df["length"], errors="coerce").to_numpy(dtype=float)
+        a = pd.to_numeric(df["angle_from_vertical_deg"], errors="coerce").to_numpy(dtype=float)
+        sw = float(np.nansum(w))
+        return float(np.nansum(a * w) / sw) if sw > 0 else np.nan
+
+    def _save_unit_xyz(
+        self,
+        tree_index_str: str,
+        unit_key: str,
+        parent_branch_id: int,
+        points_2022: np.ndarray,
+        tree_2022_kd: cKDTree,
+        unit_df: pd.DataFrame,
+    ) -> str:
+        if not self.save_fallen_xyz:
+            return ""
+
+        max_radius = float(pd.to_numeric(unit_df["radius_cyl"], errors="coerce").max())
+        search_radius = 1.5 * max_radius
+
+        s2 = unit_df[["startX", "startY", "startZ"]].to_numpy(dtype=float)
+        e2 = unit_df[["endX", "endY", "endZ"]].to_numpy(dtype=float)
+        sample = np.vstack([s2, e2])
+
+        neigh = tree_2022_kd.query_ball_point(sample, r=float(search_radius))
+        idxs = set()
+        for n in neigh:
+            idxs.update(n)
+        if not idxs:
+            return ""
+
+        pts = points_2022[np.array(sorted(idxs), dtype=int), :3]
+        out_subdir = self.out_dir / "lost_branches_xyz" / f"tree_{tree_index_str}"
+        out_subdir.mkdir(parents=True, exist_ok=True)
+
+        # Unique per unit_key, no overwriting across fragmented units
+        out_path = out_subdir / f"tree_{tree_index_str}_parent_{parent_branch_id}_unit_{unit_key}.xyz"
+        np.savetxt(out_path, pts, fmt="%.6f")
+        return str(out_path)
+
+    # ----------------------------
     # Core per-tree routine
     # ----------------------------
     def process_one_tree(self, tree_filename_2022: str, tree_filename_2023: str, tree_index_str: str):
-        """
-        Per-tree workflow:
-        - read XYZ (robust) and build KD trees
-        - load rTwig cylinders_corrected for this tree_index
-        - compute trunk (branch_order==0), DBH, height
-        - voxel differencing (Source==1)
-        - map diff voxels -> cylinders (start/end in voxels)
-        - identify missing cylinders by KD connectivity to 2023
-        - DECOMPOSE missing cylinders by parent-child graph components
-        - split components by rTwig branch id so sub-branches are not suppressed
-        - compute metrics, direction, optional save branch points
-        Returns:
-        lost_volume_ratio, cylinders_df, fallen_branch_rows, tree_metrics_dict
-        """
+        # Load point clouds
+        points_2022 = self._safe_numeric_xyz(self._read_xyz_first3(tree_filename_2022))
+        points_2023 = self._safe_numeric_xyz(self._read_xyz_first3(tree_filename_2023))
+        if points_2022.shape[0] == 0 or points_2023.shape[0] == 0:
+            raise ValueError("Empty point cloud after numeric filtering")
+
+        height_m = float(np.max(points_2022[:, 2]) - np.min(points_2022[:, 2]))
+
+        # ICP align 2023 -> 2022
+        icp_fitness, icp_rmse = np.nan, np.nan
+        points_2023_used = points_2023
+        tree_filename_2023_used = tree_filename_2023
+        if self.do_icp:
+            pts_aligned, _, icp_fitness, icp_rmse = self._icp_align_2023_to_2022(points_2022, points_2023)
+            aligned_dir = self.out_dir / "_aligned_xyz" / f"tree_{tree_index_str}"
+            aligned_2023_path = aligned_dir / f"tree_{tree_index_str}_2023_aligned.xyz"
+            self._write_xyz(aligned_2023_path, pts_aligned)
+            points_2023_used = pts_aligned
+            tree_filename_2023_used = str(aligned_2023_path)
+
+        tree_2022_kd = cKDTree(points_2022)
+        tree_2023_kd = cKDTree(points_2023_used)
+
+        # Load cylinders
+        cylinders_df = self._load_rtwig_cylinders(tree_index_str)
+        tree_folder = cylinders_df.attrs.get("rtwig_folder", "")
+
+        # Identify trunk branch (rTwig convention: branch_order == 0)
+        trunk_branch = cylinders_df.loc[cylinders_df["branch_order"] == 0, "branch"].dropna().unique()
+        if len(trunk_branch) != 1:
+            raise RuntimeError(f"Expected exactly one trunk branch, got {trunk_branch}")
+        trunk_branch = int(trunk_branch[0])
+
+        # DBH (meters) from cylinders at z0+1.3
+        z0 = float(np.nanmin(np.r_[cylinders_df["startZ"].to_numpy(dtype=float),
+                                  cylinders_df["endZ"].to_numpy(dtype=float)]))
+        z_dbh = z0 + 1.3
+        zmin = np.minimum(cylinders_df["startZ"].to_numpy(dtype=float), cylinders_df["endZ"].to_numpy(dtype=float))
+        zmax = np.maximum(cylinders_df["startZ"].to_numpy(dtype=float), cylinders_df["endZ"].to_numpy(dtype=float))
+        hit = cylinders_df[(zmin <= z_dbh) & (zmax >= z_dbh)].copy()
+        if hit.shape[0] == 0:
+            dbh_m, dbh_n_cyl = np.nan, 0
+        else:
+            d = 2.0 * hit["radius_cyl"].to_numpy(dtype=float)
+            dbh_m = float(d[0]) if d.size == 1 else float(2.0 * np.sqrt(np.sum((d / 2.0) ** 2)))
+            dbh_n_cyl = int(hit.shape[0])
 
         # ----------------------------
-        # helpers (local, no class changes required)
+        # ADDED: Tree reference frame for branch position metrics
         # ----------------------------
+        tree_xy_centroid = self._tree_xy_centroid_from_cyl(cylinders_df)
+        crown_r95 = self._crown_r95_xy(points_2022, tree_xy_centroid)
+
+        trunk_df = cylinders_df[cylinders_df["branch"].astype("Int64") == trunk_branch].copy()
+        if not trunk_df.empty:
+            ts = trunk_df[["startX", "startY", "startZ"]].to_numpy(dtype=float)
+            te = trunk_df[["endX", "endY", "endZ"]].to_numpy(dtype=float)
+            trunk_centers = 0.5 * (ts + te)
+            stem_p0_xyz, stem_u_xyz = self._pca_axis(trunk_centers)
+        else:
+            stem_p0_xyz, stem_u_xyz = np.full(3, np.nan), np.full(3, np.nan)
+
+        # Graph maps
+        row_map = cylinders_df.set_index("cyl_ID")
+        parent_map = cylinders_df.set_index("cyl_ID")["parent_ID"].to_dict()
+
+        children_map = {}
+        for cid, pid in zip(cylinders_df["cyl_ID"].astype(int).tolist(), cylinders_df["parent_ID"].astype(int).tolist()):
+            if pid < 0:
+                continue
+            children_map.setdefault(pid, []).append(cid)
+
+        def _is_cyl_present_in_2023(cyl_row: pd.Series) -> bool:
+            s = np.array([cyl_row["startX"], cyl_row["startY"], cyl_row["startZ"]], dtype=float)
+            e = np.array([cyl_row["endX"],   cyl_row["endY"],   cyl_row["endZ"]], dtype=float)
+            sc = len(tree_2023_kd.query_ball_point(s, r=self.radius))
+            ec = len(tree_2023_kd.query_ball_point(e, r=self.radius))
+            return (sc >= self.min_neighbors) or (ec >= self.min_neighbors)
+
         def _components_by_parent_graph(df: pd.DataFrame) -> list[pd.DataFrame]:
-            # df must contain cyl_ID, parent_ID
             if df.empty:
                 return []
-
             ids = set(df["cyl_ID"].astype(int).tolist())
             adj = {i: [] for i in ids}
-
-            parent_vals = pd.to_numeric(df["parent_ID"], errors="coerce").fillna(-1).astype(int).values
-            cyl_vals = df["cyl_ID"].astype(int).values
-
-            for cid, pid in zip(cyl_vals, parent_vals):
+            for cid, pid in zip(df["cyl_ID"].astype(int).tolist(), df["parent_ID"].astype(int).tolist()):
                 if pid in ids:
                     adj[cid].append(pid)
                     adj[pid].append(cid)
-
-            seen = set()
-            comps = []
+            seen, comps = set(), []
             for start in ids:
                 if start in seen:
                     continue
@@ -196,87 +631,111 @@ class BranchesChange:
                             seen.add(v)
                             stack.append(v)
                 comps.append(df[df["cyl_ID"].astype(int).isin(comp_ids)].copy())
-
             return comps
 
-        def _safe_numeric_xyz(arr: np.ndarray) -> np.ndarray:
-            arr = np.asarray(arr, dtype=np.float64)
-            ok = np.isfinite(arr).all(axis=1)
-            return arr[ok]
+        def _grow_upward(unit_df: pd.DataFrame) -> pd.DataFrame:
+            if unit_df.empty:
+                return unit_df
+            unit_ids = set(unit_df["cyl_ID"].astype(int).tolist())
+            frontier = list(unit_ids)
+            steps = 0
+            while frontier and steps < self.parent_steps_max:
+                cid = frontier.pop()
+                pid = int(parent_map.get(cid, -1))
+                if pid < 0 or pid in unit_ids or pid not in row_map.index:
+                    steps += 1
+                    continue
+                prow = row_map.loc[pid]
+                try:
+                    if int(prow.get("branch", -999)) == trunk_branch:
+                        break
+                except Exception:
+                    pass
+                if self.stop_at_present_parent:
+                    try:
+                        if _is_cyl_present_in_2023(prow):
+                            break
+                    except Exception:
+                        pass
+                unit_ids.add(pid)
+                frontier.append(pid)
+                steps += 1
+            return cylinders_df[cylinders_df["cyl_ID"].astype(int).isin(unit_ids)].copy()
+
+        def _grow_downward(unit_df: pd.DataFrame) -> pd.DataFrame:
+            if unit_df.empty:
+                return unit_df
+            unit_ids = set(unit_df["cyl_ID"].astype(int).tolist())
+            queue = list(unit_ids)
+            while queue:
+                cid = int(queue.pop())
+                for child in children_map.get(cid, []):
+                    if child in unit_ids or child not in row_map.index:
+                        continue
+                    crow = row_map.loc[int(child)]
+                    try:
+                        if int(crow.get("branch", -999)) == trunk_branch:
+                            continue
+                    except Exception:
+                        pass
+                    if self.stop_at_present_descendant:
+                        try:
+                            if _is_cyl_present_in_2023(crow):
+                                continue
+                        except Exception:
+                            pass
+                    unit_ids.add(int(child))
+                    queue.append(int(child))
+            return cylinders_df[cylinders_df["cyl_ID"].astype(int).isin(unit_ids)].copy()
+
+        def _parent_branch_id(unit_df: pd.DataFrame) -> int:
+            if unit_df.empty:
+                return -1
+            # parent defined as branch id at most proximal cylinder
+            if "base_distance" in unit_df.columns and unit_df["base_distance"].notna().any():
+                prox_idx = pd.to_numeric(unit_df["base_distance"], errors="coerce").to_numpy().argmin()
+            elif "growth_length" in unit_df.columns and unit_df["growth_length"].notna().any():
+                prox_idx = pd.to_numeric(unit_df["growth_length"], errors="coerce").to_numpy().argmin()
+            else:
+                prox_idx = pd.to_numeric(unit_df["cyl_ID"], errors="coerce").to_numpy().argmin()
+            try:
+                b = int(pd.to_numeric(unit_df.iloc[prox_idx]["branch"], errors="coerce"))
+                return b
+            except Exception:
+                bids = (
+                    unit_df.loc[unit_df["branch"].notna(), "branch"]
+                    .astype("Int64").dropna().astype(int).unique().tolist()
+                )
+                return int(bids[0]) if bids else -1
+
+        def _child_branch_stats(unit_df: pd.DataFrame, parent_bid: int):
+            bids = (
+                unit_df.loc[unit_df["branch"].notna(), "branch"]
+                .astype("Int64").dropna().astype(int).unique().tolist()
+            )
+            child_ids = [b for b in bids if b != parent_bid]
+            return int(len(child_ids)), ",".join(map(str, child_ids))
 
         # ----------------------------
-        # load point clouds + KD trees
-        # ----------------------------
-        points_2022 = self._read_xyz_first3(tree_filename_2022)
-        points_2022 = _safe_numeric_xyz(points_2022)
-        if points_2022.shape[0] == 0:
-            raise ValueError(f"No finite XYZ points in 2022 file: {tree_filename_2022}")
-        tree_2022 = cKDTree(points_2022)
-
-        points_2023 = self._read_xyz_first3(tree_filename_2023)
-        points_2023 = _safe_numeric_xyz(points_2023)
-        if points_2023.shape[0] == 0:
-            raise ValueError(f"No finite XYZ points in 2023 file: {tree_filename_2023}")
-        tree_2023 = cKDTree(points_2023)
-
-        # Tree height from points
-        zmin_2022 = float(np.min(points_2022[:, 2]))
-        zmax_2022 = float(np.max(points_2022[:, 2]))
-        height_m = zmax_2022 - zmin_2022
-
-        # ----------------------------
-        # load rTwig cylinders
-        # ----------------------------
-        cylinders_df = self._load_rtwig_cylinders(tree_index_str)
-        tree_folder = cylinders_df.attrs.get("rtwig_folder", "")
-
-        # trunk identification (rTwig convention: branch_order==0)
-        trunk_branch = cylinders_df.loc[cylinders_df["branch_order"] == 0, "branch"].dropna().unique()
-        if len(trunk_branch) != 1:
-            raise RuntimeError(f"Expected exactly one trunk branch, got {trunk_branch}")
-        trunk_branch = int(trunk_branch[0])
-
-        # ----------------------------
-        # DBH from cylinders (meters)
-        # ----------------------------
-        z0 = float(np.nanmin(np.r_[cylinders_df["startZ"].to_numpy(dtype=float),
-                                cylinders_df["endZ"].to_numpy(dtype=float)]))
-        z_dbh = z0 + 1.3
-
-        zmin = np.minimum(cylinders_df["startZ"].to_numpy(dtype=float), cylinders_df["endZ"].to_numpy(dtype=float))
-        zmax = np.maximum(cylinders_df["startZ"].to_numpy(dtype=float), cylinders_df["endZ"].to_numpy(dtype=float))
-        hit = cylinders_df[(zmin <= z_dbh) & (zmax >= z_dbh)].copy()
-
-        if hit.shape[0] == 0:
-            dbh_m = np.nan
-            dbh_n_cyl = 0
-        else:
-            d = 2.0 * hit["radius_cyl"].to_numpy(dtype=float)
-            dbh_m = float(d[0]) if d.size == 1 else float(2.0 * np.sqrt(np.sum((d / 2.0) ** 2)))
-            dbh_n_cyl = int(hit.shape[0])
-
-        # ----------------------------
-        # voxel change detection (your existing approach)
+        # Voxel differencing
         # ----------------------------
         vcd = VoxelChangeDetector()
         vcd.voxelize_trees(
             tree1_filename=tree_filename_2022,
-            tree2_filename=tree_filename_2023,
-            voxel_size=self.voxel_size
+            tree2_filename=tree_filename_2023_used,
+            voxel_size=self.voxel_size,
         )
         ref_min = vcd.ref_min_point
         _ = vcd.compare_voxels()
 
-        df1 = vcd.dataframe_1
-        df2 = vcd.dataframe_2
+        df1, df2 = vcd.dataframe_1, vcd.dataframe_2
         if df1 is None or df2 is None:
             raise RuntimeError("Voxelization did not produce df1/df2")
 
-        # tolerance-aware missing voxels (dilated)
         only1_df = VoxelChangeDetector.missing_tree1_voxels(df1, df2, dilation_voxels=self.voxel_dilation)
 
+        fallen_units = []
         total_branch_volume = 0.0
-        fallen_branch_rows = []
 
         if only1_df.shape[0] > 0:
             connected_df, _ = dbscan_connectivity(only1_df, self.voxel_size, min_samples=self.min_samples)
@@ -289,22 +748,15 @@ class BranchesChange:
 
             inside_idx = np.union1d(start_idx, end_idx)
             inside_cyl = cylinders_df.iloc[inside_idx].copy()
-
-            # Exclude trunk from analysis
             inside_cyl = inside_cyl[inside_cyl["branch"].astype("Int64") != trunk_branch]
-
             cylinders_df.loc[inside_idx, "label"] = 1
 
-            # ------------------------------------------------------------
-            # CHANGE: determine "missing cylinders" first, then decompose
-            # ------------------------------------------------------------
-
-            # KD connectivity test against 2023 at cylinder level
+            # Endpoint presence test against 2023
             s_all = inside_cyl[["startX", "startY", "startZ"]].to_numpy(dtype=float)
             e_all = inside_cyl[["endX", "endY", "endZ"]].to_numpy(dtype=float)
 
-            start_neighbors = tree_2023.query_ball_point(s_all, r=self.radius)
-            end_neighbors = tree_2023.query_ball_point(e_all, r=self.radius)
+            start_neighbors = tree_2023_kd.query_ball_point(s_all, r=self.radius)
+            end_neighbors = tree_2023_kd.query_ball_point(e_all, r=self.radius)
 
             start_counts = np.fromiter((len(v) for v in start_neighbors), dtype=int)
             end_counts = np.fromiter((len(v) for v in end_neighbors), dtype=int)
@@ -312,16 +764,14 @@ class BranchesChange:
             start_ok = start_counts >= self.min_neighbors
             end_ok = end_counts >= self.min_neighbors
 
-            # missing cylinders = neither end connects to 2023
             valid_missing_cyl = inside_cyl[~(start_ok | end_ok)].copy()
-            if not valid_missing_cyl.empty:
 
-                # components in parent-child graph of missing cylinders
+            if not valid_missing_cyl.empty:
                 comps = _components_by_parent_graph(valid_missing_cyl)
 
-                # split each component by rTwig branch id
+                # Optional splitting by rTwig branch id
                 units = []
-                if "branch" in valid_missing_cyl.columns:
+                if self.split_units_by_branch_id and "branch" in valid_missing_cyl.columns:
                     for comp in comps:
                         if comp["branch"].notna().any():
                             for bid, sub in comp.groupby(comp["branch"].astype("Int64")):
@@ -333,123 +783,169 @@ class BranchesChange:
                 else:
                     units = comps
 
-                # process each unit independently (preserves sub-branches)
-                for unit_df in units:
-                    if unit_df.empty:
+                # Expand each unit to largest possible limb
+                expanded_units = []
+                for u in units:
+                    if self.connect_to_parent:
+                        u = _grow_upward(u)
+                    if self.capture_descendants:
+                        u = _grow_downward(u)
+                    expanded_units.append(u)
+
+                # Merge fragmented units by parent branch id (largest limb per path)
+                if self.merge_by_parent_branch:
+                    merged = {}
+                    for u in expanded_units:
+                        pb = _parent_branch_id(u)
+                        if pb < 0:
+                            pb = -1
+                        ids = set(u["cyl_ID"].astype(int).tolist())
+                        merged.setdefault(pb, set()).update(ids)
+
+                    final_units = []
+                    for pb, ids in merged.items():
+                        dfu = cylinders_df[cylinders_df["cyl_ID"].astype(int).isin(ids)].copy()
+                        # ensure trunk excluded
+                        dfu = dfu[dfu["branch"].astype("Int64") != trunk_branch]
+                        if not dfu.empty:
+                            final_units.append(dfu)
+                else:
+                    final_units = expanded_units
+
+                # Convert to rows
+                for u in final_units:
+                    if u.empty:
                         continue
 
-                    # branch id label
-                    if "branch" in unit_df.columns and unit_df["branch"].notna().any():
-                        branch_id = int(unit_df["branch"].dropna().iloc[0])
-                    else:
-                        branch_id = -1
-
-                    # metrics
-                    branch_length = float(pd.to_numeric(unit_df["length"], errors="coerce").sum())
-                    if branch_length <= 5.0:
+                    branch_length = float(pd.to_numeric(u["length"], errors="coerce").sum())
+                    if branch_length <= self.min_branch_length_m:
                         continue
 
-                    total_volume = float(pd.to_numeric(unit_df["volume"], errors="coerce").sum())
+                    total_volume = float(pd.to_numeric(u["volume"], errors="coerce").sum())
                     total_branch_volume += total_volume
 
-                    max_radius = float(pd.to_numeric(unit_df["radius_cyl"], errors="coerce").max())
+                    max_radius = float(pd.to_numeric(u["radius_cyl"], errors="coerce").max())
+                    surface = self._surface_area(u)
+                    angle = self._angle_from_vertical(u)
+                    origin2com = self._origin2com(u)
+                    dx, dy, dz, azimuth_deg, inclination_deg = self._branch_direction(u)
 
-                    if "surface_area_m2" in unit_df.columns:
-                        total_surface = float(pd.to_numeric(unit_df["surface_area_m2"], errors="coerce").sum())
-                    else:
-                        r = pd.to_numeric(unit_df["radius_cyl"], errors="coerce").to_numpy(dtype=float)
-                        L = pd.to_numeric(unit_df["length"], errors="coerce").to_numpy(dtype=float)
-                        total_surface = float(np.nansum(2.0 * np.pi * r * L))
+                    pb = _parent_branch_id(u)
+                    n_child, child_ids = _child_branch_stats(u, pb)
 
-                    # mean angle from vertical (length-weighted)
-                    if "angle_from_vertical_deg" in unit_df.columns:
-                        w = pd.to_numeric(unit_df["length"], errors="coerce").to_numpy(dtype=float)
-                        a = pd.to_numeric(unit_df["angle_from_vertical_deg"], errors="coerce").to_numpy(dtype=float)
-                        avg_angle_deg = float(np.nansum(a * w) / np.nansum(w)) if np.nansum(w) > 0 else np.nan
-                    else:
-                        avg_angle_deg = np.nan
+                    # stable unit key: parent branch + min cyl id (unique across merges)
+                    min_cyl = int(pd.to_numeric(u["cyl_ID"], errors="coerce").min())
+                    unit_key = f"pb{pb}_c{min_cyl}"
 
-                    # direction (proximal->distal) from your existing helper
-                    dx, dy, dz, azimuth_deg, inclination_deg = self._branch_direction(unit_df)
+                    saved_xyz = self._save_unit_xyz(
+                        tree_index_str=tree_index_str,
+                        unit_key=unit_key,
+                        parent_branch_id=pb,
+                        points_2022=points_2022,
+                        tree_2022_kd=tree_2022_kd,
+                        unit_df=u,
+                    )
 
-                    # origin2com (your existing logic, adapted to unit_df)
-                    s2 = unit_df[["startX", "startY", "startZ"]].to_numpy(dtype=float)
-                    e2 = unit_df[["endX", "endY", "endZ"]].to_numpy(dtype=float)
-                    centers = 0.5 * (s2 + e2)
+                    # ADDED: position metrics
+                    pos = self._branch_position_metrics(
+                        unit_df=u,
+                        z0=z0,
+                        height_m=height_m,
+                        tree_xy_centroid=tree_xy_centroid,
+                        crown_r95=crown_r95,
+                        stem_p0_xyz=stem_p0_xyz,
+                        stem_u_xyz=stem_u_xyz,
+                    )
 
-                    if "base_distance" in unit_df.columns and unit_df["base_distance"].notna().any():
-                        ordv = pd.to_numeric(unit_df["base_distance"], errors="coerce").to_numpy()
-                        order = np.argsort(ordv)
-                    elif "growth_length" in unit_df.columns and unit_df["growth_length"].notna().any():
-                        ordv = pd.to_numeric(unit_df["growth_length"], errors="coerce").to_numpy()
-                        order = np.argsort(ordv)
-                    else:
-                        order = np.argsort(pd.to_numeric(unit_df["cyl_ID"], errors="coerce").to_numpy())
-
-                    centers_o = centers[order]
-                    first_center = centers_o[0]
-                    last_center = centers_o[-1]
-
-                    axis_vec = last_center - first_center
-                    axis_len = float(np.linalg.norm(axis_vec))
-                    if axis_len > 0:
-                        axis_u = axis_vec / axis_len
-                        vols = pd.to_numeric(unit_df["volume"], errors="coerce").to_numpy(dtype=float)
-                        vols = np.where(np.isfinite(vols) & (vols > 0), vols, 0.0)
-                        vtot = float(np.sum(vols))
-                        if vtot > 0:
-                            com = (centers * vols[:, None]).sum(axis=0) / vtot
-                            s_first = float(first_center @ axis_u)
-                            s_last = float(last_center @ axis_u)
-                            s_com = float(com @ axis_u)
-                            denom = abs(s_last - s_first)
-                            origin2com = float(100.0 * abs(s_com - s_first) / denom) if denom > 0 else np.nan
-                        else:
-                            origin2com = np.nan
-                    else:
-                        origin2com = np.nan
-
-                    # save per-unit point subset from 2022 (XYZ)
-                    saved_xyz = ""
-                    try:
-                        search_radius = 1.5 * max_radius
-                        out_subdir = self.out_dir / "lost_branches_xyz" / f"tree_{tree_index_str}"
-                        out_path = self._save_branch_points_xyz(
-                            out_subdir=out_subdir,
-                            tree_index_str=tree_index_str,
-                            branch_id=branch_id,
-                            points_2022=points_2022,
-                            tree_2022_kd=tree_2022,
-                            starts=s2,
-                            ends=e2,
-                            search_radius=search_radius,
-                        )
-                        saved_xyz = str(out_path) if out_path else ""
-                    except Exception:
-                        saved_xyz = ""
-
-                    fallen_branch_rows.append({
+                    row = {
                         "tree_index": tree_index_str,
                         "tree_folder": tree_folder,
-                        "branch_id": branch_id,
-                        "volume": total_volume,
-                        "length": branch_length,
-                        "surface": total_surface,
-                        "max_radius": max_radius,
-                        "angle": avg_angle_deg,
-                        "origin2com": origin2com,
-                        "dir_dx": dx,
-                        "dir_dy": dy,
-                        "dir_dz": dz,
-                        "azimuth_deg": azimuth_deg,
-                        "inclination_deg": inclination_deg,
-                        "dbh_m": dbh_m,
-                        "height_m": height_m,
+                        "parent_branch_id": int(pb),
+                        "n_child_branches": int(n_child),
+                        "child_branch_ids": child_ids,
+                        "volume": float(total_volume),
+                        "length": float(branch_length),
+                        "surface": float(surface),
+                        "max_radius": float(max_radius),
+                        "angle": float(angle) if np.isfinite(angle) else np.nan,
+                        "origin2com": float(origin2com) if np.isfinite(origin2com) else np.nan,
+                        "dir_dx": float(dx),
+                        "dir_dy": float(dy),
+                        "dir_dz": float(dz),
+                        "azimuth_deg": float(azimuth_deg),
+                        "inclination_deg": float(inclination_deg),
+                        "dbh_m": float(dbh_m) if np.isfinite(dbh_m) else np.nan,
+                        "height_m": float(height_m),
+                        "unit_key": unit_key,
                         "saved_xyz": saved_xyz,
-                    })
+                    }
+                    row.update(pos)
+                    fallen_units.append(row)
 
         denom = float(pd.to_numeric(cylinders_df["volume"], errors="coerce").sum())
         lost_volume_ratio = (total_branch_volume / denom) if denom > 0 else np.nan
+
+        # Intact branches: all rTwig branches excluding trunk and fallen parent branches
+        fallen_parent_ids = set(int(r["parent_branch_id"]) for r in fallen_units if int(r["parent_branch_id"]) >= 0)
+
+        all_branch_ids = (
+            cylinders_df.loc[cylinders_df["branch"].notna(), "branch"]
+            .astype("Int64").dropna().astype(int).unique().tolist()
+        )
+        all_branch_ids = [b for b in all_branch_ids if b != trunk_branch]
+        intact_ids = [b for b in all_branch_ids if b not in fallen_parent_ids]
+
+        intact_rows = []
+        for bid in intact_ids:
+            bdf = cylinders_df[cylinders_df["branch"].astype("Int64") == bid].copy()
+            if bdf.empty:
+                continue
+            blen = float(pd.to_numeric(bdf["length"], errors="coerce").sum())
+            if blen <= self.min_branch_length_m:
+                continue
+
+            bvol = float(pd.to_numeric(bdf["volume"], errors="coerce").sum())
+            bmaxr = float(pd.to_numeric(bdf["radius_cyl"], errors="coerce").max())
+            bsurf = self._surface_area(bdf)
+            bang = self._angle_from_vertical(bdf)
+            bcom = self._origin2com(bdf)
+            dx, dy, dz, az, inc = self._branch_direction(bdf)
+
+            # ADDED: position metrics for intact branch (as a unit)
+            pos = self._branch_position_metrics(
+                unit_df=bdf,
+                z0=z0,
+                height_m=height_m,
+                tree_xy_centroid=tree_xy_centroid,
+                crown_r95=crown_r95,
+                stem_p0_xyz=stem_p0_xyz,
+                stem_u_xyz=stem_u_xyz,
+            )
+
+            row = {
+                "tree_index": tree_index_str,
+                "tree_folder": tree_folder,
+                "parent_branch_id": int(bid),
+                "n_child_branches": 0,
+                "child_branch_ids": "",
+                "volume": float(bvol),
+                "length": float(blen),
+                "surface": float(bsurf),
+                "max_radius": float(bmaxr),
+                "angle": float(bang) if np.isfinite(bang) else np.nan,
+                "origin2com": float(bcom) if np.isfinite(bcom) else np.nan,
+                "dir_dx": float(dx),
+                "dir_dy": float(dy),
+                "dir_dz": float(dz),
+                "azimuth_deg": float(az),
+                "inclination_deg": float(inc),
+                "dbh_m": float(dbh_m) if np.isfinite(dbh_m) else np.nan,
+                "height_m": float(height_m),
+                "unit_key": f"intact_pb{bid}",
+                "saved_xyz": "",
+            }
+            row.update(pos)
+            intact_rows.append(row)
 
         tree_metrics = {
             "tree_index": tree_index_str,
@@ -459,91 +955,39 @@ class BranchesChange:
             "dbh_n_cyl": dbh_n_cyl,
             "height_m": height_m,
             "n_cylinders": int(len(cylinders_df)),
-            "n_fallen_branches": int(len(fallen_branch_rows)),
+            "n_fallen_units": int(len(fallen_units)),
+            "n_fallen_parent_branches": int(len(set(int(r["parent_branch_id"]) for r in fallen_units if int(r["parent_branch_id"]) >= 0))),
+            "icp_fitness": icp_fitness,
+            "icp_inlier_rmse": icp_rmse,
         }
 
-        return lost_volume_ratio, cylinders_df, fallen_branch_rows, tree_metrics
+        return lost_volume_ratio, fallen_units, intact_rows, tree_metrics
 
-
-    
-    def _branch_direction(self, df: pd.DataFrame):
-        """
-        Returns (dx,dy,dz, azimuth_deg, inclination_deg) for a branch.
-        Uses proximal->distal centers if base_distance exists, otherwise growth_length, else cyl_ID.
-        """
-        if df.empty:
-            return (np.nan, np.nan, np.nan, np.nan, np.nan)
-
-        # order cylinders along the branch
-        if "base_distance" in df.columns and df["base_distance"].notna().any():
-            dd = pd.to_numeric(df["base_distance"], errors="coerce")
-            dfo = df.iloc[np.argsort(dd.to_numpy())].copy()
-        elif "growth_length" in df.columns and df["growth_length"].notna().any():
-            dd = pd.to_numeric(df["growth_length"], errors="coerce")
-            dfo = df.iloc[np.argsort(dd.to_numpy())].copy()
-        else:
-            dfo = df.sort_values("cyl_ID").copy()
-
-        # cylinder centers
-        s = dfo[["startX","startY","startZ"]].to_numpy(dtype=float)
-        e = dfo[["endX","endY","endZ"]].to_numpy(dtype=float)
-        centers = 0.5 * (s + e)
-
-        # proximal = first center, distal = last center
-        v = centers[-1] - centers[0]
-        dx, dy, dz = float(v[0]), float(v[1]), float(v[2])
-
-        # azimuth in XY
-        az = (np.degrees(np.arctan2(dy, dx)) + 360.0) % 360.0
-
-        # inclination relative to horizontal plane
-        horiz = np.hypot(dx, dy)
-        inc = np.degrees(np.arctan2(dz, horiz))
-
-        return (dx, dy, dz, float(az), float(inc))
-
-
-    def _save_branch_points_xyz(
+    # ----------------------------
+    # Runner
+    # ----------------------------
+    def run(
         self,
-        out_subdir: Path,
-        tree_index_str: str,
-        branch_id: int,
-        points_2022: np.ndarray,
-        tree_2022_kd: cKDTree,
-        starts: np.ndarray,
-        ends: np.ndarray,
-        search_radius: float,
+        split_units_by_branch_id: bool | None = None,
+        connect_to_parent: bool | None = None,
+        capture_descendants: bool | None = None,
+        merge_by_parent_branch: bool | None = None,
     ):
-        out_subdir.mkdir(parents=True, exist_ok=True)
-        sample = np.vstack([starts, ends])  # (2N, 3)
-        neigh = tree_2022_kd.query_ball_point(sample, r=float(search_radius))
+        if split_units_by_branch_id is not None:
+            self.split_units_by_branch_id = bool(split_units_by_branch_id)
+        if connect_to_parent is not None:
+            self.connect_to_parent = bool(connect_to_parent)
+        if capture_descendants is not None:
+            self.capture_descendants = bool(capture_descendants)
+        if merge_by_parent_branch is not None:
+            self.merge_by_parent_branch = bool(merge_by_parent_branch)
 
-        idxs = set()
-        for n in neigh:
-            idxs.update(n)
-        if not idxs:
-            return None
-
-        idxs = np.array(sorted(idxs), dtype=int)
-        pts = points_2022[idxs, :3]
-
-        out_path = out_subdir / f"tree_{tree_index_str}_branch_{branch_id}.xyz"
-        np.savetxt(out_path, pts, fmt="%.6f")
-        return out_path
-
-
-    # ----------------------------
-    # Batch runner (incremental writes)
-    # ----------------------------
-    def run(self):
-        # ---- locate source 2022 folder (support both patterns) ----
         src_2022 = self.in_dir_src
         candidate = self.in_dir_src / "2022" / "matched_xyz_species"
         if candidate.exists():
             src_2022 = candidate
 
         tgt_2023 = self.in_dir_target
-
         if not src_2022.exists():
             raise FileNotFoundError(f"2022 source folder not found: {src_2022}")
         if not tgt_2023.exists():
@@ -551,151 +995,145 @@ class BranchesChange:
 
         src_files = [p for p in src_2022.iterdir() if p.is_file() and p.suffix.lower() == ".xyz"]
         tgt_files = [p for p in tgt_2023.iterdir() if p.is_file() and p.suffix.lower() == ".xyz"]
-
-        if not src_files:
-            raise FileNotFoundError(f"No .xyz files found in 2022 source folder: {src_2022}")
-        if not tgt_files:
-            raise FileNotFoundError(f"No .xyz files found in 2023 target folder: {tgt_2023}")
+        if not src_files or not tgt_files:
+            raise FileNotFoundError("Missing .xyz files in source or target folder")
 
         src_by_idx = {self._tree_index_str(p.name): p for p in src_files}
         tgt_by_idx = {self._tree_index_str(p.name): p for p in tgt_files}
 
         common = sorted(set(src_by_idx.keys()) & set(tgt_by_idx.keys()), key=lambda x: int(x))
         if not common:
-            raise RuntimeError("No matching tree indices between 2022 source and 2023 target folders.")
+            raise RuntimeError("No matching tree indices between 2022 and 2023 folders")
 
-        # ---- ensure outputs exist with headers ----
-        self.out_dir.mkdir(parents=True, exist_ok=True)
-
-        if not self.tree_out.exists():
-            pd.DataFrame(columns=self.tree_cols).to_csv(self.tree_out, index=False)
-        if not self.fallen_out.exists():
-            pd.DataFrame(columns=self.fallen_cols).to_csv(self.fallen_out, index=False)
-        if not self.fail_out.exists():
-            pd.DataFrame(columns=self.fail_cols).to_csv(self.fail_out, index=False)
-
-        # ---- optional resume: skip indices already written in tree_out ----
+        # optional resume on tree_out
         done = set()
         try:
-            if self.tree_out.exists():
-                prev = pd.read_csv(self.tree_out, usecols=["tree_index"], dtype={"tree_index": str})
-                done = set(prev["tree_index"].dropna().astype(str).tolist())
+            prev = pd.read_csv(self.tree_out, usecols=["tree_index"], dtype={"tree_index": str})
+            done = set(prev["tree_index"].dropna().astype(str).tolist())
         except Exception:
             done = set()
-
         todo = [idx for idx in common if idx not in done]
         if not todo:
-            print("[run] Nothing to do: all common indices already in tree output.")
-            return pd.DataFrame(), pd.DataFrame()
+            print("[run] Nothing to do")
+            return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-        fallen_rows_all = []
-        tree_rows_all = []
-        fail_rows_all = []
+        fallen_buf, intact_buf, tree_buf, fail_buf = [], [], [], []
 
-        # in-memory buffers (flush_every controls write frequency)
-        fallen_buf = []
-        tree_buf = []
-        fail_buf = []
-
-        def _flush_buffers():
-            nonlocal fallen_buf, tree_buf, fail_buf
+        def _flush():
+            nonlocal fallen_buf, intact_buf, tree_buf, fail_buf
 
             if tree_buf:
-                tree_df = pd.DataFrame(tree_buf)
+                df = pd.DataFrame(tree_buf)
                 for c in self.tree_cols:
-                    if c not in tree_df.columns:
-                        tree_df[c] = np.nan
-                tree_df = tree_df[self.tree_cols]
-                tree_df.to_csv(self.tree_out, mode="a", header=False, index=False)
-                tree_rows_all.extend(tree_df.to_dict(orient="records"))
+                    if c not in df.columns:
+                        df[c] = np.nan
+                df = df[self.tree_cols]
+                df.to_csv(self.tree_out, mode="a", header=False, index=False)
                 tree_buf = []
 
-            if fallen_buf:
-                fallen_df = pd.DataFrame(fallen_buf)
-                for c in self.fallen_cols:
-                    if c not in fallen_df.columns:
-                        fallen_df[c] = np.nan
-                fallen_df = fallen_df[self.fallen_cols]
-                fallen_df.to_csv(self.fallen_out, mode="a", header=False, index=False)
-                fallen_rows_all.extend(fallen_df.to_dict(orient="records"))
-                fallen_buf = []
+            def _write_branch(buf, out_path):
+                if not buf:
+                    return
+                dfb = pd.DataFrame(buf)
+                for c in self.branch_cols:
+                    if c not in dfb.columns:
+                        dfb[c] = np.nan
+                dfb = dfb[self.branch_cols]
+                dfb.to_csv(out_path, mode="a", header=False, index=False)
+
+            _write_branch(fallen_buf, self.fallen_out)
+            fallen_buf = []
+            _write_branch(intact_buf, self.intact_out)
+            intact_buf = []
 
             if fail_buf:
-                fail_df = pd.DataFrame(fail_buf)
+                dff = pd.DataFrame(fail_buf)
                 for c in self.fail_cols:
-                    if c not in fail_df.columns:
-                        fail_df[c] = np.nan
-                fail_df = fail_df[self.fail_cols]
-                fail_df.to_csv(self.fail_out, mode="a", header=False, index=False)
-                fail_rows_all.extend(fail_df.to_dict(orient="records"))
+                    if c not in dff.columns:
+                        dff[c] = np.nan
+                dff = dff[self.fail_cols]
+                dff.to_csv(self.fail_out, mode="a", header=False, index=False)
                 fail_buf = []
 
-        for loop_i, tree_index_str in enumerate(todo):
-            f2022 = src_by_idx[tree_index_str]
-            f2023 = tgt_by_idx[tree_index_str]
+        print(
+            f"[run] split_units_by_branch_id={self.split_units_by_branch_id} "
+            f"connect_to_parent={self.connect_to_parent} capture_descendants={self.capture_descendants} "
+            f"merge_by_parent_branch={self.merge_by_parent_branch} min_branch_length_m={self.min_branch_length_m}"
+        )
 
-            print(f"\n[Tree {loop_i+1}/{len(todo)}] idx={tree_index_str}")
+        for i, idx in enumerate(todo):
+            f2022 = src_by_idx[idx]
+            f2023 = tgt_by_idx[idx]
+            print(f"\n[Tree {i+1}/{len(todo)}] idx={idx}")
             print("  2022:", f2022)
             print("  2023:", f2023)
 
             try:
-                lost_ratio, cylinders_df, fallen_branch_rows, tree_metrics = self.process_one_tree(
+                lost_ratio, fallen_rows, intact_rows, tree_metrics = self.process_one_tree(
                     tree_filename_2022=str(f2022),
                     tree_filename_2023=str(f2023),
-                    tree_index_str=tree_index_str,
+                    tree_index_str=idx,
                 )
 
-                # tree_folder consistency
-                tree_folder = tree_metrics.get("tree_folder", cylinders_df.attrs.get("rtwig_folder", ""))
-                tree_metrics["tree_folder"] = tree_folder
+                # attach lost_ratio
+                for r in fallen_rows:
+                    r["lost_volume_ratio"] = lost_ratio
+                for r in intact_rows:
+                    r["lost_volume_ratio"] = lost_ratio
 
-                # buffer tree row
-                tree_row = {k: tree_metrics.get(k, np.nan) for k in self.tree_cols}
-                tree_buf.append(tree_row)
+                fallen_buf.extend(fallen_rows)
+                intact_buf.extend(intact_rows)
+                tree_buf.append({k: tree_metrics.get(k, np.nan) for k in self.tree_cols})
 
-                # buffer fallen branches
-                if fallen_branch_rows:
-                    for r in fallen_branch_rows:
-                        r.setdefault("lost_volume_ratio", lost_ratio)
-                        r.setdefault("tree_folder", tree_folder)
-                        r.setdefault("tree_index", tree_index_str)
-                    fallen_buf.extend(fallen_branch_rows)
-
-                print("  rTwig matched folder:", tree_folder)
                 print(f"  lost_volume_ratio: {lost_ratio:.6f}")
-                print(f"  fallen branches: {len(fallen_branch_rows)}")
+                print(f"  fallen units saved: {tree_metrics['n_fallen_units']}  unique parent branches: {tree_metrics['n_fallen_parent_branches']}")
+                print(f"  intact branches saved: {len(intact_rows)}")
+                print(f"  icp_fitness: {tree_metrics.get('icp_fitness')}  icp_rmse: {tree_metrics.get('icp_inlier_rmse')}")
 
             except Exception as e:
-                fail_row = {"tree_index": tree_index_str, "tree_folder": "", "err": str(e)}
-                fail_buf.append(fail_row)
-                print(f"[SKIP] idx={tree_index_str}: {e}")
+                fail_buf.append({"tree_index": idx, "tree_folder": "", "err": str(e)})
+                print(f"[SKIP] idx={idx}: {e}")
 
-            # ---- flush cadence ----
             fe = int(getattr(self, "flush_every", 1))
-            if fe <= 1 or ((loop_i + 1) % fe == 0):
-                _flush_buffers()
-                if fe > 1:
-                    print(f"[WRITE] progress checkpoint at tree {loop_i+1}")
+            if fe <= 1 or ((i + 1) % fe == 0):
+                _flush()
 
-        # final flush
-        _flush_buffers()
-
-        return pd.DataFrame(fallen_rows_all), pd.DataFrame(tree_rows_all)
+        _flush()
+        return pd.read_csv(self.fallen_out), pd.read_csv(self.intact_out), pd.read_csv(self.tree_out)
 
 
-# ----------------------------
-# Example usage
-# ----------------------------
-bc = BranchesChange(
-    in_dir_src=r"D:\Chris\Hydro\Karl\translation\raw\part1",
-    in_dir_target=r"D:\Karl\hydro\dataset\Working\single_trees\part1\2023\matched_xyz_species",
-    qsm_dir=r"D:\Chris\Hydro\Karl\translation\rTwig\part1",
-    out_dir=r"D:\Chris\Hydro\Karl\translation\change",
-    radius=0.25,
-    min_neighbors=1,
-    voxel_size=0.25,
-    min_samples=10,
-    voxel_dilation=0,
-    flush_every=1,
-)
-fallen_df, tree_df = bc.run()
+# # ----------------------------
+# # Example usage
+# # ----------------------------
+# if __name__ == "__main__":
+#     bc = BranchesChange(
+#         in_dir_src=r"D:\Chris\Hydro\Karl\translation\raw\part1", ### Oldest (source) tree point clouds
+#         in_dir_target=r"D:\Karl\hydro\dataset\Working\single_trees\part1\2023\matched_xyz_species", ### Newest (target) tree point clouds
+#         qsm_dir=r"D:\Chris\Hydro\Karl\translation\rTwig\part1", ### rTwig cylinders (from 2022 point clouds)
+#         out_dir=r"D:\Chris\Hydro\Karl\translation\change", ### Output folder for CSVs and saved XYZ of fallen branches
+#         radius=0.5,
+#         min_neighbors=1,
+#         voxel_size=0.5,
+#         min_samples=5,
+#         voxel_dilation=1,
+#         flush_every=1,
+#         min_branch_length_m=2.0,
+#         do_icp=True,
+#         icp_voxel=0.05,
+#         icp_max_corr=0.25,
+#         icp_max_iters=60,
+#         icp_use_point_to_plane=True,
+#         connect_to_parent=True,
+#         capture_descendants=True,
+#         stop_at_present_descendant=True,
+#         split_units_by_branch_id=False,   # biggest branches possible
+#         merge_by_parent_branch=True,      # merge fragmented canopy-edge detections
+#         save_fallen_xyz=True,
+#     )
+
+#     fallen_df, intact_df, tree_df = bc.run(
+#         split_units_by_branch_id=False,
+#         connect_to_parent=True,
+#         capture_descendants=True,
+#         merge_by_parent_branch=True,
+#     )
